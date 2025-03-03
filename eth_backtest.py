@@ -11,8 +11,8 @@ class ETHBacktester:
     def __init__(self, initial_capital=2000):
         self.initial_capital = initial_capital
         self.capital = initial_capital
-        self.stablecoin_reserve = initial_capital * 0.3  # 30% in stablecoin reserve
-        self.trading_capital = initial_capital * 0.7     # 70% for active trading
+        self.stablecoin_reserve = initial_capital * 0.2  # 20% in stablecoin reserve (reduced from 30%)
+        self.trading_capital = initial_capital * 0.8     # 80% for active trading (increased from 70%)
         self.position_size = 0
         self.in_position = False
         self.entry_price = 0
@@ -21,12 +21,12 @@ class ETHBacktester:
         self.trailing_stop = None
         self.trailing_stop_active = False
         
-        # Settings
-        self.risk_per_trade = 0.02          # 2% risk per trade
-        self.stop_loss_percentage = 0.05    # 5% stop loss
-        self.take_profit_percentage = 0.15  # 15% take profit
-        self.trailing_stop_activation = 0.05  # Activate trailing stop after 5% profit
-        self.trailing_stop_distance = 0.03    # 3% trailing stop distance
+        # Settings - more aggressive
+        self.risk_per_trade = 0.03          # 3% risk per trade (increased from 2%)
+        self.stop_loss_percentage = 0.04    # 4% stop loss (reduced from 5%)
+        self.take_profit_percentage = 0.12  # 12% take profit (reduced from 15%)
+        self.trailing_stop_activation = 0.04  # Activate trailing stop after 4% profit (reduced from 5%)
+        self.trailing_stop_distance = 0.025   # 2.5% trailing stop distance (reduced from 3%)
         
         # Performance tracking
         self.trades = []
@@ -37,9 +37,8 @@ class ETHBacktester:
         """Fetch historical OHLCV data for ETH/USDT"""
         print("Fetching historical ETH data for the last 30 days...")
         
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
-        })
+        # Try multiple exchanges in case one is restricted
+        exchanges_to_try = ['binance', 'kucoin', 'kraken', 'coinbase']
         
         # Calculate start and end timestamps
         end_date = datetime.now()
@@ -49,26 +48,50 @@ class ETHBacktester:
         timeframes = {'1h': '1h', '4h': '4h', '1d': '1d'}
         data = {}
         
-        for name, timeframe in timeframes.items():
-            # Fetch data from exchange
-            ohlcv = exchange.fetch_ohlcv(
-                symbol='ETH/USDT',
-                timeframe=timeframe,
-                since=int(start_date.timestamp() * 1000),
-                limit=1000  # Maximum candles
-            )
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            # Calculate indicators
-            df = self.calculate_indicators(df)
-            
-            data[name] = df
-            print(f"Fetched {len(df)} {timeframe} candles for ETH/USDT")
-            
+        for exchange_id in exchanges_to_try:
+            try:
+                print(f"Trying to fetch data from {exchange_id}...")
+                exchange = getattr(ccxt, exchange_id)({
+                    'enableRateLimit': True,
+                })
+                
+                success = True
+                for name, timeframe in timeframes.items():
+                    try:
+                        # Fetch data from exchange
+                        ohlcv = exchange.fetch_ohlcv(
+                            symbol='ETH/USDT',
+                            timeframe=timeframe,
+                            since=int(start_date.timestamp() * 1000),
+                            limit=1000  # Maximum candles
+                        )
+                        
+                        # Convert to DataFrame
+                        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                        df.set_index('timestamp', inplace=True)
+                        
+                        # Calculate indicators
+                        df = self.calculate_indicators(df)
+                        
+                        data[name] = df
+                        print(f"Fetched {len(df)} {timeframe} candles for ETH/USDT from {exchange_id}")
+                    except Exception as e:
+                        print(f"Error fetching {timeframe} data from {exchange_id}: {str(e)}")
+                        success = False
+                        break
+                
+                if success and all(tf in data for tf in timeframes):
+                    print(f"Successfully fetched all data from {exchange_id}")
+                    return data
+                    
+            except Exception as e:
+                print(f"Error initializing {exchange_id}: {str(e)}")
+        
+        # If we couldn't get data from any exchange, raise an error
+        if not data:
+            raise Exception("Could not fetch data from any exchange. Please check your internet connection and exchange availability.")
+        
         return data
     
     def calculate_indicators(self, df):
@@ -119,56 +142,78 @@ class ETHBacktester:
             latest = history.iloc[-1]
             prev = history.iloc[-2]
             
-            # Trend analysis
+            # Trend analysis - more sensitive to short-term trends
             analysis['trend'] = 'neutral'
             if latest['sma20'] > latest['sma50']:
                 analysis['trend'] = 'bullish'
             elif latest['sma20'] < latest['sma50']:
                 analysis['trend'] = 'bearish'
             
-            # Momentum analysis
+            # Momentum analysis - adjusted RSI thresholds for more trades
             analysis['momentum'] = 'neutral'
-            if latest['rsi'] > 70:
+            if latest['rsi'] > 65:  # Lowered from 70
                 analysis['momentum'] = 'overbought'
-            elif latest['rsi'] < 30:
+            elif latest['rsi'] < 35:  # Raised from 30
                 analysis['momentum'] = 'oversold'
             
-            # MACD analysis
+            # MACD analysis - more sensitive to crossovers
             analysis['macd_signal'] = 'neutral'
             if latest['macd'] > latest['signal'] and prev['macd'] <= prev['signal']:
                 analysis['macd_signal'] = 'bullish_crossover'
             elif latest['macd'] < latest['signal'] and prev['macd'] >= prev['signal']:
                 analysis['macd_signal'] = 'bearish_crossover'
+            # Add MACD direction
+            if latest['macd'] > prev['macd']:
+                analysis['macd_direction'] = 'rising'
+            else:
+                analysis['macd_direction'] = 'falling'
             
-            # BB analysis
+            # BB analysis - more aggressive entries and exits
             analysis['bb_signal'] = 'neutral'
-            if latest['close'] > latest['bb_upper']:
+            if latest['close'] > latest['bb_upper'] * 0.98:  # 98% of upper band
                 analysis['bb_signal'] = 'overbought'
-            elif latest['close'] < latest['bb_lower']:
+            elif latest['close'] < latest['bb_lower'] * 1.02:  # 102% of lower band
                 analysis['bb_signal'] = 'oversold'
+            
+            # Add price action signals
+            analysis['price_action'] = 'neutral'
+            # Bullish engulfing
+            if prev['close'] < prev['open'] and latest['close'] > latest['open'] and latest['close'] > prev['open'] and latest['open'] < prev['close']:
+                analysis['price_action'] = 'bullish'
+            # Bearish engulfing
+            elif prev['close'] > prev['open'] and latest['close'] < latest['open'] and latest['close'] < prev['open'] and latest['open'] > prev['close']:
+                analysis['price_action'] = 'bearish'
             
             # Combine signals
             analysis['entry_signals'] = 0
             analysis['exit_signals'] = 0
             
-            # Count entry signals
+            # Count entry signals - more weight to short-term signals
             if analysis['trend'] == 'bullish':
                 analysis['entry_signals'] += 1
             if analysis['momentum'] == 'oversold':
-                analysis['entry_signals'] += 1
+                analysis['entry_signals'] += 1.5  # More weight to RSI
             if analysis['macd_signal'] == 'bullish_crossover':
-                analysis['entry_signals'] += 1
+                analysis['entry_signals'] += 1.5  # More weight to MACD crossover
+            if analysis['macd_direction'] == 'rising':
+                analysis['entry_signals'] += 0.5  # Add MACD direction
             if analysis['bb_signal'] == 'oversold':
+                analysis['entry_signals'] += 1
+            if analysis['price_action'] == 'bullish':
                 analysis['entry_signals'] += 1
             
             # Count exit signals
             if analysis['trend'] == 'bearish':
                 analysis['exit_signals'] += 1
             if analysis['momentum'] == 'overbought':
-                analysis['exit_signals'] += 1
+                analysis['exit_signals'] += 1.5  # More weight to RSI
             if analysis['macd_signal'] == 'bearish_crossover':
-                analysis['exit_signals'] += 1
+                analysis['exit_signals'] += 1.5  # More weight to MACD crossover
+            if analysis['macd_direction'] == 'falling':
+                analysis['exit_signals'] += 0.5  # Add MACD direction
             if analysis['bb_signal'] == 'overbought':
+                analysis['exit_signals'] += 1
+            if analysis['price_action'] == 'bearish':
                 analysis['exit_signals'] += 1
             
             analysis_results[timeframe] = analysis
@@ -180,25 +225,63 @@ class ETHBacktester:
         if not analysis_results:  # Skip if no analysis available
             return 'wait'
             
-        # Combine signals from different timeframes
-        entry_signals = sum([analysis_results[tf]['entry_signals'] for tf in analysis_results])
-        exit_signals = sum([analysis_results[tf]['exit_signals'] for tf in analysis_results])
+        # Combine signals from different timeframes with more weight to shorter timeframes
+        timeframe_weights = {'1h': 0.5, '4h': 0.3, '1d': 0.2}
+        entry_signals = 0
+        exit_signals = 0
+        
+        for tf in analysis_results:
+            weight = timeframe_weights.get(tf, 0.33)
+            entry_signals += analysis_results[tf]['entry_signals'] * weight
+            exit_signals += analysis_results[tf]['exit_signals'] * weight
         
         # Calculate signal strength (0-1)
-        max_possible_signals = len(analysis_results) * 4  # 4 signals per timeframe
+        max_possible_signals = sum(timeframe_weights.values()) * 6  # 6 signals per timeframe
         entry_strength = entry_signals / max_possible_signals if max_possible_signals > 0 else 0
         exit_strength = exit_signals / max_possible_signals if max_possible_signals > 0 else 0
         
-        # Make decision
+        # Log signal strengths periodically (every 6 hours)
+        if timestamp.hour % 6 == 0 and timestamp.minute == 0:
+            print(f"\nSignal analysis at {timestamp}:")
+            print(f"Price: ${current_price:.2f}")
+            print(f"Entry signals: {entry_signals} / {max_possible_signals} (strength: {entry_strength:.2f})")
+            print(f"Exit signals: {exit_signals} / {max_possible_signals} (strength: {exit_strength:.2f})")
+            print(f"Current position: {'In position' if self.in_position else 'No position'}")
+            
+            # Log detailed analysis for each timeframe
+            for tf in analysis_results:
+                analysis = analysis_results[tf]
+                print(f"\n{tf} Analysis:")
+                print(f"  Trend: {analysis['trend']}")
+                print(f"  Momentum: {analysis['momentum']}")
+                print(f"  MACD: {analysis['macd_signal']}")
+                print(f"  BB: {analysis['bb_signal']}")
+                print(f"  Entry signals: {analysis['entry_signals']}")
+                print(f"  Exit signals: {analysis['exit_signals']}")
+        
+        # Log when we're close to a trading decision
+        if entry_strength > 0.3 and not self.in_position:
+            print(f"\nClose to BUY at {timestamp}:")
+            print(f"Entry strength: {entry_strength:.2f} (threshold: 0.35)")
+            for tf in analysis_results:
+                print(f"  {tf} signals: {analysis_results[tf]['entry_signals']}")
+        
+        if exit_strength > 0.3 and self.in_position:
+            print(f"\nClose to SELL at {timestamp}:")
+            print(f"Exit strength: {exit_strength:.2f} (threshold: 0.3)")
+            for tf in analysis_results:
+                print(f"  {tf} signals: {analysis_results[tf]['exit_signals']}")
+        
+        # Make decision - more aggressive thresholds
         if self.in_position:
             # For existing positions, consider exit
-            if exit_strength > 0.4:  # Exit if more than 40% of exit signals are triggered
+            if exit_strength > 0.3:  # Lowered from 0.4 for more trades
                 return 'sell'
             else:
                 return 'hold'
         else:
             # For potential new positions
-            if entry_strength > 0.5:  # Enter if more than 50% of entry signals are triggered
+            if entry_strength > 0.35:  # Lowered from 0.5 for more trades
                 # Check if we have available trading capital
                 if self.trading_capital > 0:
                     return 'buy'
