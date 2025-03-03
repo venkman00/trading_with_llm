@@ -24,12 +24,12 @@ class ETHBacktester:
         self.trailing_stop = None
         self.trailing_stop_active = False
         
-        # Settings - more aggressive
-        self.risk_per_trade = 0.03          # 3% risk per trade (increased from 2%)
-        self.stop_loss_percentage = 0.04    # 4% stop loss (reduced from 5%)
-        self.take_profit_percentage = 0.12  # 12% take profit (reduced from 15%)
-        self.trailing_stop_activation = 0.04  # Activate trailing stop after 4% profit (reduced from 5%)
-        self.trailing_stop_distance = 0.025   # 2.5% trailing stop distance (reduced from 3%)
+        # IMPROVED SETTINGS - more optimized for crypto volatility
+        self.risk_per_trade = 0.02          # 2% risk per trade (reduced from 3% for better capital preservation)
+        self.stop_loss_percentage = 0.05    # 5% stop loss (increased from 4% to reduce false stops)
+        self.take_profit_percentage = 0.15  # 15% take profit (increased from 12% to capture more upside)
+        self.trailing_stop_activation = 0.06  # Activate trailing stop after 6% profit (increased from 4%)
+        self.trailing_stop_distance = 0.03    # 3% trailing stop distance (increased from 2.5%)
         
         # Performance tracking
         self.trades = []
@@ -207,6 +207,26 @@ class ETHBacktester:
         # Add ADX for trend strength
         adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14)
         df['adx'] = adx.adx()
+        df['di_plus'] = adx.adx_pos()
+        df['di_minus'] = adx.adx_neg()
+        
+        # NEW: Add Stochastic Oscillator
+        stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'], window=14, smooth_window=3)
+        df['stoch_k'] = stoch.stoch()
+        df['stoch_d'] = stoch.stoch_signal()
+        
+        # NEW: Add Ichimoku Cloud components
+        ichimoku = ta.trend.IchimokuIndicator(df['high'], df['low'], window1=9, window2=26, window3=52)
+        df['ichimoku_a'] = ichimoku.ichimoku_a()
+        df['ichimoku_b'] = ichimoku.ichimoku_b()
+        df['ichimoku_base'] = ichimoku.ichimoku_base_line()
+        df['ichimoku_conversion'] = ichimoku.ichimoku_conversion_line()
+        
+        # NEW: Add OBV (On-Balance Volume)
+        df['obv'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+        
+        # NEW: Add Parabolic SAR
+        df['psar'] = ta.trend.psar_up(df['high'], df['low'], df['close'])
         
         return df
     
@@ -228,30 +248,38 @@ class ETHBacktester:
             latest = history.iloc[-1]
             prev = history.iloc[-2]
             
-            # Log data types and shapes for debugging
-            self.logger.debug(f"Analyzing {timeframe} at {timestamp}")
-            self.logger.debug(f"latest['volume'] type: {type(latest['volume'])}, value: {latest['volume']}")
-            
             # === IMPROVED STRATEGY LOGIC ===
             
-            # 1. Trend strength using ADX
+            # 1. Trend strength using ADX and DI
             adx_threshold = 25
             analysis['trend_strength'] = 'strong' if latest['adx'] > adx_threshold else 'weak'
+            
+            # NEW: DI crossover detection
+            di_crossover = False
+            if prev['di_plus'] < prev['di_minus'] and latest['di_plus'] > latest['di_minus']:
+                di_crossover = 'bullish'
+            elif prev['di_plus'] > prev['di_minus'] and latest['di_plus'] < latest['di_minus']:
+                di_crossover = 'bearish'
             
             # 2. Enhanced trend direction using multiple EMAs
             ema_short = latest['ema9']
             ema_medium = latest['ema21']
             ema_long = latest['ema50']
+            ema_vlong = latest['ema200']
             
             # Check if EMAs are aligned for strong trend
-            if ema_short > ema_medium > ema_long:
+            if ema_short > ema_medium > ema_long > ema_vlong:
                 analysis['trend'] = 'strong_bullish'
-            elif ema_short < ema_medium < ema_long:
+            elif ema_short < ema_medium < ema_long < ema_vlong:
                 analysis['trend'] = 'strong_bearish'
-            elif ema_short > ema_medium:
+            elif ema_short > ema_medium > ema_long:
                 analysis['trend'] = 'bullish'
-            elif ema_short < ema_medium:
+            elif ema_short < ema_medium < ema_long:
                 analysis['trend'] = 'bearish'
+            elif ema_short > ema_medium:
+                analysis['trend'] = 'weak_bullish'
+            elif ema_short < ema_medium:
+                analysis['trend'] = 'weak_bearish'
             else:
                 analysis['trend'] = 'neutral'
             
@@ -264,17 +292,28 @@ class ETHBacktester:
             else:
                 analysis['volatility'] = 'low'
             
-            # 4. Momentum with RSI and MACD
+            # 4. Momentum with RSI and Stochastic
             analysis['momentum'] = 'neutral'
             if latest['rsi'] < 30:
                 analysis['momentum'] = 'oversold'
             elif latest['rsi'] > 70:
                 analysis['momentum'] = 'overbought'
             
+            # NEW: Stochastic signals
+            analysis['stoch_signal'] = 'neutral'
+            if latest['stoch_k'] < 20 and latest['stoch_d'] < 20:
+                analysis['stoch_signal'] = 'oversold'
+            elif latest['stoch_k'] > 80 and latest['stoch_d'] > 80:
+                analysis['stoch_signal'] = 'overbought'
+            elif latest['stoch_k'] < 20 and latest['stoch_k'] > latest['stoch_d']:
+                analysis['stoch_signal'] = 'bullish_crossover'
+            elif latest['stoch_k'] > 80 and latest['stoch_k'] < latest['stoch_d']:
+                analysis['stoch_signal'] = 'bearish_crossover'
+            
             # 5. MACD signal with histogram direction
             analysis['macd_signal'] = 'neutral'
-            macd_hist = latest['macd'] - latest['macd_signal']
-            prev_macd_hist = prev['macd'] - prev['macd_signal']
+            macd_hist = latest['macd_hist']
+            prev_macd_hist = prev['macd_hist']
             
             if latest['macd'] > latest['macd_signal']:
                 if macd_hist > prev_macd_hist:
@@ -296,14 +335,16 @@ class ETHBacktester:
             elif latest['close'] > latest['bb_upper']:
                 analysis['bb_signal'] = 'overbought'
             
-            # 7. Volume analysis - FIX THE COMPARISON ISSUE
+            # NEW: Bollinger Band squeeze detection (volatility contraction)
+            analysis['bb_squeeze'] = False
+            if bb_width < 0.1:  # Narrow bands indicate potential breakout
+                analysis['bb_squeeze'] = True
+            
+            # 7. Volume analysis
             analysis['volume_signal'] = 'neutral'
             
             # Calculate volume moving average
             volume_ma = history['volume'].rolling(20).mean().iloc[-1]
-            
-            # Log the values for debugging
-            self.logger.debug(f"Volume: {latest['volume']}, Volume MA: {volume_ma}, Threshold: {volume_ma * 1.5}")
             
             # Compare scalar values properly
             if latest['volume'] > (volume_ma * 1.5):
@@ -311,6 +352,34 @@ class ETHBacktester:
                     analysis['volume_signal'] = 'bullish'
                 else:
                     analysis['volume_signal'] = 'bearish'
+            
+            # NEW: OBV trend analysis
+            obv_ma = history['obv'].rolling(20).mean().iloc[-1]
+            if latest['obv'] > obv_ma and latest['obv'] > prev['obv']:
+                analysis['obv_signal'] = 'bullish'
+            elif latest['obv'] < obv_ma and latest['obv'] < prev['obv']:
+                analysis['obv_signal'] = 'bearish'
+            else:
+                analysis['obv_signal'] = 'neutral'
+            
+            # NEW: Ichimoku Cloud analysis
+            analysis['ichimoku_signal'] = 'neutral'
+            if (latest['close'] > latest['ichimoku_a'] and 
+                latest['close'] > latest['ichimoku_b'] and
+                latest['ichimoku_base'] > latest['ichimoku_b']):
+                analysis['ichimoku_signal'] = 'bullish'
+            elif (latest['close'] < latest['ichimoku_a'] and 
+                  latest['close'] < latest['ichimoku_b'] and
+                  latest['ichimoku_base'] < latest['ichimoku_b']):
+                analysis['ichimoku_signal'] = 'bearish'
+            
+            # NEW: Parabolic SAR signal
+            analysis['psar_signal'] = 'neutral'
+            if not np.isnan(latest['psar']):
+                if latest['psar'] < latest['close']:
+                    analysis['psar_signal'] = 'bullish'
+                else:
+                    analysis['psar_signal'] = 'bearish'
             
             # === ENTRY/EXIT SIGNAL CALCULATION ===
             
@@ -322,10 +391,18 @@ class ETHBacktester:
                 analysis['entry_signals'] += 2.0
             elif analysis['trend'] == 'bullish':
                 analysis['entry_signals'] += 1.0
+            elif analysis['trend'] == 'weak_bullish':
+                analysis['entry_signals'] += 0.5
             
             # Momentum conditions
             if analysis['momentum'] == 'oversold':
-                analysis['entry_signals'] += 1.5
+                analysis['entry_signals'] += 1.0
+            
+            # NEW: Stochastic conditions
+            if analysis['stoch_signal'] == 'bullish_crossover':
+                analysis['entry_signals'] += 1.0
+            elif analysis['stoch_signal'] == 'oversold':
+                analysis['entry_signals'] += 0.5
             
             # MACD conditions
             if analysis['macd_signal'] == 'strong_bullish':
@@ -337,8 +414,28 @@ class ETHBacktester:
             if analysis['bb_signal'] == 'oversold':
                 analysis['entry_signals'] += 1.0
             
+            # NEW: BB squeeze with bullish momentum
+            if analysis['bb_squeeze'] and analysis['macd_signal'] in ['bullish', 'strong_bullish']:
+                analysis['entry_signals'] += 1.0
+            
             # Volume confirmation
             if analysis['volume_signal'] == 'bullish':
+                analysis['entry_signals'] += 0.75
+            
+            # NEW: OBV confirmation
+            if analysis['obv_signal'] == 'bullish':
+                analysis['entry_signals'] += 0.75
+            
+            # NEW: Ichimoku confirmation
+            if analysis['ichimoku_signal'] == 'bullish':
+                analysis['entry_signals'] += 1.0
+            
+            # NEW: PSAR confirmation
+            if analysis['psar_signal'] == 'bullish':
+                analysis['entry_signals'] += 0.75
+            
+            # NEW: DI crossover
+            if di_crossover == 'bullish':
                 analysis['entry_signals'] += 1.0
             
             # Calculate exit signals
@@ -349,10 +446,18 @@ class ETHBacktester:
                 analysis['exit_signals'] += 2.0
             elif analysis['trend'] == 'bearish':
                 analysis['exit_signals'] += 1.0
+            elif analysis['trend'] == 'weak_bearish':
+                analysis['exit_signals'] += 0.5
             
             # Momentum conditions
             if analysis['momentum'] == 'overbought':
-                analysis['exit_signals'] += 1.5
+                analysis['exit_signals'] += 1.0
+            
+            # NEW: Stochastic conditions
+            if analysis['stoch_signal'] == 'bearish_crossover':
+                analysis['exit_signals'] += 1.0
+            elif analysis['stoch_signal'] == 'overbought':
+                analysis['exit_signals'] += 0.5
             
             # MACD conditions
             if analysis['macd_signal'] == 'strong_bearish':
@@ -366,6 +471,22 @@ class ETHBacktester:
             
             # Volume confirmation
             if analysis['volume_signal'] == 'bearish':
+                analysis['exit_signals'] += 0.75
+            
+            # NEW: OBV confirmation
+            if analysis['obv_signal'] == 'bearish':
+                analysis['exit_signals'] += 0.75
+            
+            # NEW: Ichimoku confirmation
+            if analysis['ichimoku_signal'] == 'bearish':
+                analysis['exit_signals'] += 1.0
+            
+            # NEW: PSAR confirmation
+            if analysis['psar_signal'] == 'bearish':
+                analysis['exit_signals'] += 0.75
+            
+            # NEW: DI crossover
+            if di_crossover == 'bearish':
                 analysis['exit_signals'] += 1.0
             
             analysis_results[timeframe] = analysis
@@ -378,7 +499,7 @@ class ETHBacktester:
             return 'wait'
             
         # Combine signals from different timeframes with more weight to shorter timeframes
-        timeframe_weights = {'1h': 0.5, '4h': 0.3, '1d': 0.2}
+        timeframe_weights = {'1h': 0.4, '4h': 0.35, '1d': 0.25}  # Adjusted weights
         entry_signals = 0
         exit_signals = 0
         
@@ -388,13 +509,14 @@ class ETHBacktester:
             exit_signals += analysis_results[tf]['exit_signals'] * weight
         
         # Calculate signal strength (0-1)
-        max_possible_signals = sum(timeframe_weights.values()) * 7  # 7 signals per timeframe
+        # Adjusted for new indicators (max possible signals increased)
+        max_possible_signals = sum(timeframe_weights.values()) * 12  # Increased from 7 to 12
         entry_strength = entry_signals / max_possible_signals if max_possible_signals > 0 else 0
         exit_strength = exit_signals / max_possible_signals if max_possible_signals > 0 else 0
         
-        # Lower thresholds for more trades
-        entry_threshold = 0.35  # Lowered from 0.5
-        exit_threshold = 0.35   # Lowered from 0.4
+        # Optimized thresholds based on backtest results
+        entry_threshold = 0.30  # Slightly lowered from 0.35
+        exit_threshold = 0.32   # Slightly lowered from 0.35
         
         # Make decision
         decision = 'wait'
@@ -419,6 +541,11 @@ class ETHBacktester:
                         self.logger.info(f"    - {tf} MACD: {analysis['macd_signal']}")
                     if analysis['bb_signal'] == 'overbought':
                         self.logger.info(f"    - {tf} BB: {analysis['bb_signal']}")
+                    # Log new indicators
+                    if 'stoch_signal' in analysis and analysis['stoch_signal'] in ['overbought', 'bearish_crossover']:
+                        self.logger.info(f"    - {tf} Stochastic: {analysis['stoch_signal']}")
+                    if 'ichimoku_signal' in analysis and analysis['ichimoku_signal'] == 'bearish':
+                        self.logger.info(f"    - {tf} Ichimoku: {analysis['ichimoku_signal']}")
             else:
                 decision = 'hold'
         else:
@@ -444,6 +571,11 @@ class ETHBacktester:
                             self.logger.info(f"    - {tf} MACD: {analysis['macd_signal']}")
                         if analysis['bb_signal'] == 'oversold':
                             self.logger.info(f"    - {tf} BB: {analysis['bb_signal']}")
+                        # Log new indicators
+                        if 'stoch_signal' in analysis and analysis['stoch_signal'] in ['oversold', 'bullish_crossover']:
+                            self.logger.info(f"    - {tf} Stochastic: {analysis['stoch_signal']}")
+                        if 'ichimoku_signal' in analysis and analysis['ichimoku_signal'] == 'bullish':
+                            self.logger.info(f"    - {tf} Ichimoku: {analysis['ichimoku_signal']}")
         
         return decision
     
@@ -616,11 +748,11 @@ class ETHBacktester:
             # Track signal strengths for analysis
             if analysis_results:
                 # Calculate signal strengths
-                timeframe_weights = {'1h': 0.5, '4h': 0.3, '1d': 0.2}
+                timeframe_weights = {'1h': 0.4, '4h': 0.35, '1d': 0.25}
                 entry_signal = sum([analysis_results[tf]['entry_signals'] * timeframe_weights.get(tf, 0.33) for tf in analysis_results])
                 exit_signal = sum([analysis_results[tf]['exit_signals'] * timeframe_weights.get(tf, 0.33) for tf in analysis_results])
                 
-                max_possible = sum(timeframe_weights.values()) * 7
+                max_possible = sum(timeframe_weights.values()) * 12
                 entry_strength = entry_signal / max_possible if max_possible > 0 else 0
                 exit_strength = exit_signal / max_possible if max_possible > 0 else 0
                 
@@ -673,8 +805,8 @@ class ETHBacktester:
             self.logger.info(f"Exit strength - Min: {min(exit_strengths):.4f}, Max: {max(exit_strengths):.4f}, Avg: {sum(exit_strengths)/len(exit_strengths):.4f}")
             
             # Count how many times signals were close to thresholds
-            entry_threshold = 0.35
-            exit_threshold = 0.35
+            entry_threshold = 0.30
+            exit_threshold = 0.32
             close_entries = sum(1 for s in entry_strengths if s > entry_threshold * 0.8 and s < entry_threshold)
             close_exits = sum(1 for s in exit_strengths if s > exit_threshold * 0.8 and s < exit_threshold)
             
