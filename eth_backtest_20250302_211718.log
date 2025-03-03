@@ -1,0 +1,7 @@
+2025-03-02 21:17:18,869 - INFO - Starting new backtest with $2000.00 initial capital
+2025-03-02 21:17:18,869 - INFO - Log file created: eth_backtest_20250302_211718.log
+2025-03-02 21:17:23,951 - INFO - Starting backtest with $2000.00 initial capital...
+2025-03-02 21:17:23,951 - INFO - Data summary:
+2025-03-02 21:17:23,951 - INFO -   1h: 8756 candles from 2024-02-04 05:00:00 to 2025-02-03 00:00:00
+2025-03-02 21:17:23,951 - INFO -   4h: 2189 candles from 2024-02-04 08:00:00 to 2025-02-03 00:00:00
+2025-03-02 21:17:23,951 - INFO -   1d: 365 candles from 2024-02-05 00:00:00 to 2025-02-03 00:00:00

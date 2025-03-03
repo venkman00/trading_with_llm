@@ -1,4 +1,3 @@
-import ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -6,6 +5,10 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from dateutil.relativedelta import relativedelta
 import time
+import ta
+import logging
+import os
+import ccxt
 
 class ETHBacktester:
     def __init__(self, initial_capital=2000):
@@ -32,6 +35,29 @@ class ETHBacktester:
         self.trades = []
         self.equity_curve = []
         self.drawdowns = []
+        
+        # Set up logging
+        self.setup_logging()
+        
+    def setup_logging(self):
+        """Set up logging to file and console"""
+        # Create a unique log filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"eth_backtest_{timestamp}.log"
+        
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename),
+                logging.StreamHandler()  # Also output to console
+            ]
+        )
+        
+        self.logger = logging.getLogger("ETHBacktester")
+        self.logger.info(f"Starting new backtest with ${self.initial_capital:.2f} initial capital")
+        self.logger.info(f"Log file created: {log_filename}")
         
     def fetch_historical_data(self, days=365):
         """Fetch historical OHLCV data for ETH/USDT for a specific date range"""
@@ -142,33 +168,45 @@ class ETHBacktester:
         return data
     
     def calculate_indicators(self, df):
-        """Calculate technical indicators on the dataframe"""
-        # Calculate Moving Averages
-        df['sma20'] = df['close'].rolling(window=20).mean()
-        df['sma50'] = df['close'].rolling(window=50).mean()
-        df['sma200'] = df['close'].rolling(window=200).mean()
+        """Calculate technical indicators for analysis"""
+        if len(df) < 50:
+            return df
         
-        # Calculate RSI
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.rolling(window=14).mean()
-        avg_loss = loss.rolling(window=14).mean()
-        rs = avg_gain / avg_loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+        # Copy the dataframe to avoid warnings
+        df = df.copy()
         
-        # Calculate MACD
-        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = df['ema12'] - df['ema26']
-        df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['signal']
+        # Add EMAs
+        df['ema9'] = ta.trend.ema_indicator(df['close'], window=9)
+        df['ema21'] = ta.trend.ema_indicator(df['close'], window=21)
+        df['ema50'] = ta.trend.ema_indicator(df['close'], window=50)
+        df['ema200'] = ta.trend.ema_indicator(df['close'], window=200)
         
-        # Calculate Bollinger Bands
-        df['bb_middle'] = df['close'].rolling(window=20).mean()
-        df['bb_std'] = df['close'].rolling(window=20).std()
-        df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
-        df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
+        # Add SMAs
+        df['sma20'] = ta.trend.sma_indicator(df['close'], window=20)
+        df['sma50'] = ta.trend.sma_indicator(df['close'], window=50)
+        df['sma200'] = ta.trend.sma_indicator(df['close'], window=200)
+        
+        # Add RSI
+        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+        
+        # Add MACD
+        macd = ta.trend.MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_hist'] = macd.macd_diff()
+        
+        # Add Bollinger Bands
+        bollinger = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+        df['bb_upper'] = bollinger.bollinger_hband()
+        df['bb_middle'] = bollinger.bollinger_mavg()
+        df['bb_lower'] = bollinger.bollinger_lband()
+        
+        # Add ATR for volatility
+        df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
+        
+        # Add ADX for trend strength
+        adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14)
+        df['adx'] = adx.adx()
         
         return df
     
@@ -181,6 +219,7 @@ class ETHBacktester:
             history = df[df.index <= timestamp].copy()
             
             if len(history) < 50:  # Need enough data for indicators
+                self.logger.warning(f"Not enough data for {timeframe} at {timestamp}: {len(history)} points")
                 continue
                 
             analysis = {}
@@ -189,79 +228,145 @@ class ETHBacktester:
             latest = history.iloc[-1]
             prev = history.iloc[-2]
             
-            # Trend analysis - more sensitive to short-term trends
-            analysis['trend'] = 'neutral'
-            if latest['sma20'] > latest['sma50']:
+            # Log data types and shapes for debugging
+            self.logger.debug(f"Analyzing {timeframe} at {timestamp}")
+            self.logger.debug(f"latest['volume'] type: {type(latest['volume'])}, value: {latest['volume']}")
+            
+            # === IMPROVED STRATEGY LOGIC ===
+            
+            # 1. Trend strength using ADX
+            adx_threshold = 25
+            analysis['trend_strength'] = 'strong' if latest['adx'] > adx_threshold else 'weak'
+            
+            # 2. Enhanced trend direction using multiple EMAs
+            ema_short = latest['ema9']
+            ema_medium = latest['ema21']
+            ema_long = latest['ema50']
+            
+            # Check if EMAs are aligned for strong trend
+            if ema_short > ema_medium > ema_long:
+                analysis['trend'] = 'strong_bullish'
+            elif ema_short < ema_medium < ema_long:
+                analysis['trend'] = 'strong_bearish'
+            elif ema_short > ema_medium:
                 analysis['trend'] = 'bullish'
-            elif latest['sma20'] < latest['sma50']:
+            elif ema_short < ema_medium:
                 analysis['trend'] = 'bearish'
-            
-            # Momentum analysis - adjusted RSI thresholds for more trades
-            analysis['momentum'] = 'neutral'
-            if latest['rsi'] > 65:  # Lowered from 70
-                analysis['momentum'] = 'overbought'
-            elif latest['rsi'] < 35:  # Raised from 30
-                analysis['momentum'] = 'oversold'
-            
-            # MACD analysis - more sensitive to crossovers
-            analysis['macd_signal'] = 'neutral'
-            if latest['macd'] > latest['signal'] and prev['macd'] <= prev['signal']:
-                analysis['macd_signal'] = 'bullish_crossover'
-            elif latest['macd'] < latest['signal'] and prev['macd'] >= prev['signal']:
-                analysis['macd_signal'] = 'bearish_crossover'
-            # Add MACD direction
-            if latest['macd'] > prev['macd']:
-                analysis['macd_direction'] = 'rising'
             else:
-                analysis['macd_direction'] = 'falling'
+                analysis['trend'] = 'neutral'
             
-            # BB analysis - more aggressive entries and exits
+            # 3. Volatility assessment using ATR
+            atr_percent = latest['atr'] / latest['close'] * 100
+            if atr_percent > 3:
+                analysis['volatility'] = 'high'
+            elif atr_percent > 1.5:
+                analysis['volatility'] = 'medium'
+            else:
+                analysis['volatility'] = 'low'
+            
+            # 4. Momentum with RSI and MACD
+            analysis['momentum'] = 'neutral'
+            if latest['rsi'] < 30:
+                analysis['momentum'] = 'oversold'
+            elif latest['rsi'] > 70:
+                analysis['momentum'] = 'overbought'
+            
+            # 5. MACD signal with histogram direction
+            analysis['macd_signal'] = 'neutral'
+            macd_hist = latest['macd'] - latest['macd_signal']
+            prev_macd_hist = prev['macd'] - prev['macd_signal']
+            
+            if latest['macd'] > latest['macd_signal']:
+                if macd_hist > prev_macd_hist:
+                    analysis['macd_signal'] = 'strong_bullish'
+                else:
+                    analysis['macd_signal'] = 'bullish'
+            elif latest['macd'] < latest['macd_signal']:
+                if macd_hist < prev_macd_hist:
+                    analysis['macd_signal'] = 'strong_bearish'
+                else:
+                    analysis['macd_signal'] = 'bearish'
+            
+            # 6. Support/Resistance with Bollinger Bands
             analysis['bb_signal'] = 'neutral'
-            if latest['close'] > latest['bb_upper'] * 0.98:  # 98% of upper band
-                analysis['bb_signal'] = 'overbought'
-            elif latest['close'] < latest['bb_lower'] * 1.02:  # 102% of lower band
+            bb_width = (latest['bb_upper'] - latest['bb_lower']) / latest['bb_middle']
+            
+            if latest['close'] < latest['bb_lower']:
                 analysis['bb_signal'] = 'oversold'
+            elif latest['close'] > latest['bb_upper']:
+                analysis['bb_signal'] = 'overbought'
             
-            # Add price action signals
-            analysis['price_action'] = 'neutral'
-            # Bullish engulfing
-            if prev['close'] < prev['open'] and latest['close'] > latest['open'] and latest['close'] > prev['open'] and latest['open'] < prev['close']:
-                analysis['price_action'] = 'bullish'
-            # Bearish engulfing
-            elif prev['close'] > prev['open'] and latest['close'] < latest['open'] and latest['close'] < prev['open'] and latest['open'] > prev['close']:
-                analysis['price_action'] = 'bearish'
+            # 7. Volume analysis - FIX THE COMPARISON ISSUE
+            analysis['volume_signal'] = 'neutral'
             
-            # Combine signals
+            # Calculate volume moving average
+            volume_ma = history['volume'].rolling(20).mean().iloc[-1]
+            
+            # Log the values for debugging
+            self.logger.debug(f"Volume: {latest['volume']}, Volume MA: {volume_ma}, Threshold: {volume_ma * 1.5}")
+            
+            # Compare scalar values properly
+            if latest['volume'] > (volume_ma * 1.5):
+                if latest['close'] > latest['open']:
+                    analysis['volume_signal'] = 'bullish'
+                else:
+                    analysis['volume_signal'] = 'bearish'
+            
+            # === ENTRY/EXIT SIGNAL CALCULATION ===
+            
+            # Calculate entry signals with weighted approach
             analysis['entry_signals'] = 0
+            
+            # Strong trend conditions for entry
+            if analysis['trend'] == 'strong_bullish' and analysis['trend_strength'] == 'strong':
+                analysis['entry_signals'] += 2.0
+            elif analysis['trend'] == 'bullish':
+                analysis['entry_signals'] += 1.0
+            
+            # Momentum conditions
+            if analysis['momentum'] == 'oversold':
+                analysis['entry_signals'] += 1.5
+            
+            # MACD conditions
+            if analysis['macd_signal'] == 'strong_bullish':
+                analysis['entry_signals'] += 1.5
+            elif analysis['macd_signal'] == 'bullish':
+                analysis['entry_signals'] += 0.75
+            
+            # BB conditions
+            if analysis['bb_signal'] == 'oversold':
+                analysis['entry_signals'] += 1.0
+            
+            # Volume confirmation
+            if analysis['volume_signal'] == 'bullish':
+                analysis['entry_signals'] += 1.0
+            
+            # Calculate exit signals
             analysis['exit_signals'] = 0
             
-            # Count entry signals - more weight to short-term signals
-            if analysis['trend'] == 'bullish':
-                analysis['entry_signals'] += 1
-            if analysis['momentum'] == 'oversold':
-                analysis['entry_signals'] += 1.5  # More weight to RSI
-            if analysis['macd_signal'] == 'bullish_crossover':
-                analysis['entry_signals'] += 1.5  # More weight to MACD crossover
-            if analysis['macd_direction'] == 'rising':
-                analysis['entry_signals'] += 0.5  # Add MACD direction
-            if analysis['bb_signal'] == 'oversold':
-                analysis['entry_signals'] += 1
-            if analysis['price_action'] == 'bullish':
-                analysis['entry_signals'] += 1
+            # Strong trend conditions for exit
+            if analysis['trend'] == 'strong_bearish' and analysis['trend_strength'] == 'strong':
+                analysis['exit_signals'] += 2.0
+            elif analysis['trend'] == 'bearish':
+                analysis['exit_signals'] += 1.0
             
-            # Count exit signals
-            if analysis['trend'] == 'bearish':
-                analysis['exit_signals'] += 1
+            # Momentum conditions
             if analysis['momentum'] == 'overbought':
-                analysis['exit_signals'] += 1.5  # More weight to RSI
-            if analysis['macd_signal'] == 'bearish_crossover':
-                analysis['exit_signals'] += 1.5  # More weight to MACD crossover
-            if analysis['macd_direction'] == 'falling':
-                analysis['exit_signals'] += 0.5  # Add MACD direction
+                analysis['exit_signals'] += 1.5
+            
+            # MACD conditions
+            if analysis['macd_signal'] == 'strong_bearish':
+                analysis['exit_signals'] += 1.5
+            elif analysis['macd_signal'] == 'bearish':
+                analysis['exit_signals'] += 0.75
+            
+            # BB conditions
             if analysis['bb_signal'] == 'overbought':
-                analysis['exit_signals'] += 1
-            if analysis['price_action'] == 'bearish':
-                analysis['exit_signals'] += 1
+                analysis['exit_signals'] += 1.0
+            
+            # Volume confirmation
+            if analysis['volume_signal'] == 'bearish':
+                analysis['exit_signals'] += 1.0
             
             analysis_results[timeframe] = analysis
         
@@ -283,60 +388,37 @@ class ETHBacktester:
             exit_signals += analysis_results[tf]['exit_signals'] * weight
         
         # Calculate signal strength (0-1)
-        max_possible_signals = sum(timeframe_weights.values()) * 6  # 6 signals per timeframe
+        max_possible_signals = sum(timeframe_weights.values()) * 7  # 7 signals per timeframe
         entry_strength = entry_signals / max_possible_signals if max_possible_signals > 0 else 0
         exit_strength = exit_signals / max_possible_signals if max_possible_signals > 0 else 0
         
-        # Log signal strengths periodically (every day)
-        if timestamp.hour == 0 and timestamp.minute == 0:
-            print(f"\n=== Daily Signal Analysis at {timestamp} ===")
-            print(f"Price: ${current_price:.2f}")
-            print(f"Entry signals: {entry_signals:.2f} / {max_possible_signals} (strength: {entry_strength:.2f})")
-            print(f"Exit signals: {exit_signals:.2f} / {max_possible_signals} (strength: {exit_strength:.2f})")
-            print(f"Current position: {'In position' if self.in_position else 'No position'}")
-            print(f"Trading capital: ${self.trading_capital:.2f}")
-            
-            # Log detailed analysis for each timeframe
-            for tf in analysis_results:
-                analysis = analysis_results[tf]
-                print(f"\n{tf} Analysis:")
-                print(f"  Trend: {analysis['trend']}")
-                print(f"  Momentum: {analysis['momentum']}")
-                print(f"  MACD: {analysis['macd_signal']}")
-                print(f"  BB: {analysis['bb_signal']}")
-                if 'price_action' in analysis:
-                    print(f"  Price Action: {analysis['price_action']}")
-                print(f"  Entry signals: {analysis['entry_signals']}")
-                print(f"  Exit signals: {analysis['exit_signals']}")
+        # Lower thresholds for more trades
+        entry_threshold = 0.35  # Lowered from 0.5
+        exit_threshold = 0.35   # Lowered from 0.4
         
-        # Log when we're close to a trading decision (within 80% of threshold)
-        threshold_proximity = 0.8
-        entry_threshold = 0.5
-        exit_threshold = 0.4
-        
-        if entry_strength > entry_threshold * threshold_proximity and not self.in_position:
-            print(f"\nClose to BUY at {timestamp}:")
-            print(f"Price: ${current_price:.2f}")
-            print(f"Entry strength: {entry_strength:.2f} (threshold: {entry_threshold})")
-            for tf in analysis_results:
-                print(f"  {tf} signals: {analysis_results[tf]['entry_signals']}")
-        
-        if exit_strength > exit_threshold * threshold_proximity and self.in_position:
-            print(f"\nClose to SELL at {timestamp}:")
-            print(f"Price: ${current_price:.2f}")
-            print(f"Exit strength: {exit_strength:.2f} (threshold: {exit_threshold})")
-            for tf in analysis_results:
-                print(f"  {tf} signals: {analysis_results[tf]['exit_signals']}")
-        
-        # Log actual trading decisions
+        # Make decision
         decision = 'wait'
         if self.in_position:
             # For existing positions, consider exit
             if exit_strength > exit_threshold:
                 decision = 'sell'
-                print(f"\n!!! SELL SIGNAL at {timestamp} !!!")
-                print(f"Price: ${current_price:.2f}")
-                print(f"Exit strength: {exit_strength:.2f} (threshold: {exit_threshold})")
+                self.logger.info(f"\n!!! SELL SIGNAL at {timestamp} !!!")
+                self.logger.info(f"Price: ${current_price:.2f}")
+                self.logger.info(f"Exit strength: {exit_strength:.2f} (threshold: {exit_threshold})")
+                
+                # Log detailed exit reasons
+                self.logger.info("Exit signal details:")
+                for tf in analysis_results:
+                    analysis = analysis_results[tf]
+                    self.logger.info(f"  {tf}: {analysis['exit_signals']} signals")
+                    if analysis['trend'] in ['bearish', 'strong_bearish']:
+                        self.logger.info(f"    - {tf} trend: {analysis['trend']}")
+                    if analysis['momentum'] == 'overbought':
+                        self.logger.info(f"    - {tf} RSI: {analysis['momentum']}")
+                    if analysis['macd_signal'] in ['bearish', 'strong_bearish']:
+                        self.logger.info(f"    - {tf} MACD: {analysis['macd_signal']}")
+                    if analysis['bb_signal'] == 'overbought':
+                        self.logger.info(f"    - {tf} BB: {analysis['bb_signal']}")
             else:
                 decision = 'hold'
         else:
@@ -345,15 +427,23 @@ class ETHBacktester:
                 # Check if we have available trading capital
                 if self.trading_capital > 0:
                     decision = 'buy'
-                    print(f"\n!!! BUY SIGNAL at {timestamp} !!!")
-                    print(f"Price: ${current_price:.2f}")
-                    print(f"Entry strength: {entry_strength:.2f} (threshold: {entry_threshold})")
-        
-        # Log signal distribution histogram monthly
-        if timestamp.day == 1 and timestamp.hour == 0 and timestamp.minute == 0:
-            print(f"\n=== Monthly Signal Distribution as of {timestamp} ===")
-            print(f"Entry strength distribution (threshold: {entry_threshold}):")
-            print(f"Exit strength distribution (threshold: {exit_threshold}):")
+                    self.logger.info(f"\n!!! BUY SIGNAL at {timestamp} !!!")
+                    self.logger.info(f"Price: ${current_price:.2f}")
+                    self.logger.info(f"Entry strength: {entry_strength:.2f} (threshold: {entry_threshold})")
+                    
+                    # Log detailed entry reasons
+                    self.logger.info("Entry signal details:")
+                    for tf in analysis_results:
+                        analysis = analysis_results[tf]
+                        self.logger.info(f"  {tf}: {analysis['entry_signals']} signals")
+                        if analysis['trend'] in ['bullish', 'strong_bullish']:
+                            self.logger.info(f"    - {tf} trend: {analysis['trend']}")
+                        if analysis['momentum'] == 'oversold':
+                            self.logger.info(f"    - {tf} RSI: {analysis['momentum']}")
+                        if analysis['macd_signal'] in ['bullish', 'strong_bullish']:
+                            self.logger.info(f"    - {tf} MACD: {analysis['macd_signal']}")
+                        if analysis['bb_signal'] == 'oversold':
+                            self.logger.info(f"    - {tf} BB: {analysis['bb_signal']}")
         
         return decision
     
@@ -392,7 +482,7 @@ class ETHBacktester:
                     'take_profit': self.take_profit
                 })
                 
-                print(f"BUY at {timestamp}: {position_size:.6f} ETH at ${price:.2f}, " + 
+                self.logger.info(f"BUY at {timestamp}: {position_size:.6f} ETH at ${price:.2f}, " + 
                       f"Cost: ${cost:.2f}, Stop: ${self.stop_loss:.2f}, Target: ${self.take_profit:.2f}")
         
         elif action == 'sell' and self.in_position:
@@ -415,7 +505,7 @@ class ETHBacktester:
                 'pl_amount': pl_amount
             })
             
-            print(f"SELL at {timestamp}: {self.position_size:.6f} ETH at ${price:.2f}, " + 
+            self.logger.info(f"SELL at {timestamp}: {self.position_size:.6f} ETH at ${price:.2f}, " + 
                   f"P/L: {pl_percent:.2%} (${pl_amount:.2f})")
             
             # Reset position
@@ -430,11 +520,11 @@ class ETHBacktester:
     def check_stop_loss(self, price, timestamp):
         """Check if stop loss or take profit has been triggered"""
         if not self.in_position:
-            return
+            return False
         
         # Check if price hit take profit
         if price >= self.take_profit:
-            print(f"Take profit hit at {timestamp}: ${price:.2f}")
+            self.logger.info(f"Take profit hit at {timestamp}: ${price:.2f}")
             self.execute_trade('sell', price, timestamp)
             return True
         
@@ -444,18 +534,19 @@ class ETHBacktester:
             profit_percent >= self.trailing_stop_activation):
             self.trailing_stop_active = True
             self.trailing_stop = price * (1 - self.trailing_stop_distance)
-            print(f"Trailing stop activated at {timestamp}: ${self.trailing_stop:.2f}")
+            self.logger.info(f"Trailing stop activated at {timestamp}: ${self.trailing_stop:.2f}")
         
         # Update trailing stop if needed
         if self.trailing_stop_active:
             new_stop = price * (1 - self.trailing_stop_distance)
             if new_stop > self.trailing_stop:
                 self.trailing_stop = new_stop
+                self.logger.debug(f"Trailing stop updated at {timestamp}: ${self.trailing_stop:.2f}")
         
         # Check if price hit stop loss or trailing stop
         stop_price = self.trailing_stop if self.trailing_stop_active else self.stop_loss
         if price <= stop_price:
-            print(f"Stop loss hit at {timestamp}: ${price:.2f}")
+            self.logger.info(f"Stop loss hit at {timestamp}: ${price:.2f}")
             self.execute_trade('sell', price, timestamp)
             return True
         
@@ -470,15 +561,15 @@ class ETHBacktester:
     
     def run_backtest(self, market_data):
         """Run backtest on historical data"""
-        print(f"Starting backtest with ${self.initial_capital:.2f} initial capital...")
+        self.logger.info(f"Starting backtest with ${self.initial_capital:.2f} initial capital...")
         
         # Get hourly data for detailed price movements
         hourly_data = market_data['1h']
         
         # Log data summary
-        print(f"Data summary:")
+        self.logger.info(f"Data summary:")
         for timeframe, df in market_data.items():
-            print(f"  {timeframe}: {len(df)} candles from {df.index[0]} to {df.index[-1]}")
+            self.logger.info(f"  {timeframe}: {len(df)} candles from {df.index[0]} to {df.index[-1]}")
         
         # Track equity curve
         equity_values = []
@@ -519,12 +610,28 @@ class ETHBacktester:
                 entry_signal = sum([analysis_results[tf]['entry_signals'] * timeframe_weights.get(tf, 0.33) for tf in analysis_results])
                 exit_signal = sum([analysis_results[tf]['exit_signals'] * timeframe_weights.get(tf, 0.33) for tf in analysis_results])
                 
-                max_possible = sum(timeframe_weights.values()) * 6
+                max_possible = sum(timeframe_weights.values()) * 7
                 entry_strength = entry_signal / max_possible if max_possible > 0 else 0
                 exit_strength = exit_signal / max_possible if max_possible > 0 else 0
                 
                 entry_strengths.append(entry_strength)
                 exit_strengths.append(exit_strength)
+                
+                # Log detailed analysis periodically (daily at midnight)
+                if timestamp.hour == 0 and timestamp.minute == 0:
+                    self.logger.info(f"\n=== Daily Analysis at {timestamp} ===")
+                    self.logger.info(f"Price: ${current_price:.2f}")
+                    self.logger.info(f"Portfolio value: ${self.calculate_portfolio_value(current_price):.2f}")
+                    self.logger.info(f"Entry strength: {entry_strength:.4f}, Exit strength: {exit_strength:.4f}")
+                    
+                    for tf in analysis_results:
+                        analysis = analysis_results[tf]
+                        self.logger.info(f"\n{tf} Analysis:")
+                        for key, value in analysis.items():
+                            if key not in ['entry_signals', 'exit_signals']:
+                                self.logger.info(f"  {key}: {value}")
+                        self.logger.info(f"  Entry signals: {analysis['entry_signals']}")
+                        self.logger.info(f"  Exit signals: {analysis['exit_signals']}")
             
             # Execute trade if needed
             if decision in ['buy', 'sell']:
@@ -543,6 +650,7 @@ class ETHBacktester:
                 current_drawdown = (max_equity - portfolio_value) / max_equity
                 if current_drawdown > max_drawdown:
                     max_drawdown = current_drawdown
+                    self.logger.info(f"New maximum drawdown: {max_drawdown:.2%} at {timestamp}")
         
         # Store final equity curve and drawdown
         self.equity_curve = list(zip(timestamps, equity_values))
@@ -550,18 +658,18 @@ class ETHBacktester:
         
         # Log signal strength statistics
         if entry_strengths:
-            print("\nSignal Strength Statistics:")
-            print(f"Entry strength - Min: {min(entry_strengths):.4f}, Max: {max(entry_strengths):.4f}, Avg: {sum(entry_strengths)/len(entry_strengths):.4f}")
-            print(f"Exit strength - Min: {min(exit_strengths):.4f}, Max: {max(exit_strengths):.4f}, Avg: {sum(exit_strengths)/len(exit_strengths):.4f}")
+            self.logger.info("\nSignal Strength Statistics:")
+            self.logger.info(f"Entry strength - Min: {min(entry_strengths):.4f}, Max: {max(entry_strengths):.4f}, Avg: {sum(entry_strengths)/len(entry_strengths):.4f}")
+            self.logger.info(f"Exit strength - Min: {min(exit_strengths):.4f}, Max: {max(exit_strengths):.4f}, Avg: {sum(exit_strengths)/len(exit_strengths):.4f}")
             
             # Count how many times signals were close to thresholds
-            entry_threshold = 0.5
-            exit_threshold = 0.4
+            entry_threshold = 0.35
+            exit_threshold = 0.35
             close_entries = sum(1 for s in entry_strengths if s > entry_threshold * 0.8 and s < entry_threshold)
             close_exits = sum(1 for s in exit_strengths if s > exit_threshold * 0.8 and s < exit_threshold)
             
-            print(f"Signals close to but below entry threshold: {close_entries}")
-            print(f"Signals close to but below exit threshold: {close_exits}")
+            self.logger.info(f"Signals close to but below entry threshold: {close_entries}")
+            self.logger.info(f"Signals close to but below exit threshold: {close_exits}")
         
         # Calculate performance metrics
         final_value = equity_values[-1] if equity_values else self.initial_capital
@@ -590,20 +698,30 @@ class ETHBacktester:
             unrealized_pl = self.position_size * (last_price - self.entry_price)
         
         # Print results
-        print("\n===== BACKTEST RESULTS =====")
-        print(f"Testing Period: {hourly_data.index[0]} to {hourly_data.index[-1]}")
-        print(f"Initial Capital: ${self.initial_capital:.2f}")
-        print(f"Final Capital: ${final_value:.2f}")
-        print(f"Total Return: {total_return:.2f}%")
-        print(f"Maximum Drawdown: {max_drawdown * 100:.2f}%")
-        print(f"Total Trades: {total_trades}")
-        print(f"Win Rate: {win_rate * 100:.2f}%")
-        print(f"Average Profit: ${avg_profit:.2f}")
-        print(f"Average Loss: ${avg_loss:.2f}")
-        print(f"Profit Factor: {profit_factor:.2f}")
+        self.logger.info("\n===== BACKTEST RESULTS =====")
+        self.logger.info(f"Testing Period: {hourly_data.index[0]} to {hourly_data.index[-1]}")
+        self.logger.info(f"Initial Capital: ${self.initial_capital:.2f}")
+        self.logger.info(f"Final Capital: ${final_value:.2f}")
+        self.logger.info(f"Total Return: {total_return:.2f}%")
+        self.logger.info(f"Maximum Drawdown: {max_drawdown * 100:.2f}%")
+        self.logger.info(f"Total Trades: {total_trades}")
+        self.logger.info(f"Win Rate: {win_rate * 100:.2f}%")
+        self.logger.info(f"Average Profit: ${avg_profit:.2f}")
+        self.logger.info(f"Average Loss: ${avg_loss:.2f}")
+        self.logger.info(f"Profit Factor: {profit_factor:.2f}")
         if self.in_position:
-            print(f"Currently In Position: {self.position_size:.6f} ETH @ ${self.entry_price:.2f}")
-            print(f"Unrealized P&L: ${unrealized_pl:.2f}")
+            self.logger.info(f"Currently In Position: {self.position_size:.6f} ETH @ ${self.entry_price:.2f}")
+            self.logger.info(f"Unrealized P&L: ${unrealized_pl:.2f}")
+        
+        # Log all trades
+        self.logger.info("\n===== TRADE HISTORY =====")
+        for i, trade in enumerate(self.trades):
+            if trade['action'] == 'buy':
+                self.logger.info(f"Trade {i+1}: BUY {trade['position_size']:.6f} ETH at ${trade['price']:.2f} on {trade['timestamp']}")
+            elif trade['action'] == 'sell':
+                pl_percent = trade.get('pl_percent', 0) * 100
+                pl_amount = trade.get('pl_amount', 0)
+                self.logger.info(f"Trade {i+1}: SELL {trade['position_size']:.6f} ETH at ${trade['price']:.2f} on {trade['timestamp']} - P/L: {pl_percent:.2f}% (${pl_amount:.2f})")
         
         return {
             'initial_capital': self.initial_capital,

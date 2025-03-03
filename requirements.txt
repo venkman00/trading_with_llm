@@ -2,4 +2,5 @@ ccxt
 pandas
 numpy
 matplotlib
-python-dateutil 
+python-dateutil
+ta
