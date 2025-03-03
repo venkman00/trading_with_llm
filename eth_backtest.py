@@ -11,8 +11,8 @@ class ETHBacktester:
     def __init__(self, initial_capital=2000):
         self.initial_capital = initial_capital
         self.capital = initial_capital
-        self.stablecoin_reserve = initial_capital * 0.2  # 20% in stablecoin reserve (reduced from 30%)
-        self.trading_capital = initial_capital * 0.8     # 80% for active trading (increased from 70%)
+        self.stablecoin_reserve = 0  # No stablecoin reserve needed for backtesting
+        self.trading_capital = initial_capital  # Use full capital for trading
         self.position_size = 0
         self.in_position = False
         self.entry_price = 0
@@ -33,16 +33,17 @@ class ETHBacktester:
         self.equity_curve = []
         self.drawdowns = []
         
-    def fetch_historical_data(self, days=30):
-        """Fetch historical OHLCV data for ETH/USDT"""
-        print("Fetching historical ETH data for the last 30 days...")
+    def fetch_historical_data(self, days=365):
+        """Fetch historical OHLCV data for ETH/USDT for a specific date range"""
+        # Set explicit end date as February 3, 2025
+        end_date = datetime(2025, 2, 3)
+        # Calculate start date as 1 year before
+        start_date = end_date - timedelta(days=days)
+        
+        print(f"Fetching historical ETH data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         
         # Try multiple exchanges in case one is restricted
-        exchanges_to_try = ['binance', 'kucoin', 'kraken', 'coinbase']
-        
-        # Calculate start and end timestamps
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
+        exchanges_to_try = ['kucoin', 'kraken', 'coinbase']
         
         # Fetch 1h, 4h and 1d timeframes
         timeframes = {'1h': '1h', '4h': '4h', '1d': '1d'}
@@ -53,29 +54,75 @@ class ETHBacktester:
                 print(f"Trying to fetch data from {exchange_id}...")
                 exchange = getattr(ccxt, exchange_id)({
                     'enableRateLimit': True,
+                    'timeout': 30000,  # Increase timeout to 30 seconds
                 })
                 
                 success = True
                 for name, timeframe in timeframes.items():
                     try:
-                        # Fetch data from exchange
-                        ohlcv = exchange.fetch_ohlcv(
-                            symbol='ETH/USDT',
-                            timeframe=timeframe,
-                            since=int(start_date.timestamp() * 1000),
-                            limit=1000  # Maximum candles
-                        )
+                        # For longer periods, we need to fetch data in chunks
+                        all_ohlcv = []
+                        since = int(start_date.timestamp() * 1000)
+                        until = int(end_date.timestamp() * 1000)
                         
+                        print(f"Fetching {timeframe} data from {exchange_id} for period: {start_date} to {end_date}")
+                        
+                        # Fetch data in chunks of 1000 candles
+                        while since < until:
+                            print(f"Fetching chunk from {datetime.fromtimestamp(since/1000)}")
+                            ohlcv = exchange.fetch_ohlcv(
+                                symbol='ETH/USDT',
+                                timeframe=timeframe,
+                                since=since,
+                                limit=1000  # Maximum candles per request
+                            )
+                            
+                            if not ohlcv or len(ohlcv) == 0:
+                                print(f"No data returned for this chunk, stopping")
+                                break
+                                
+                            all_ohlcv.extend(ohlcv)
+                            
+                            # Update since for next iteration - use the timestamp of the last candle + 1
+                            last_timestamp = ohlcv[-1][0]
+                            since = last_timestamp + 1
+                            
+                            print(f"Fetched {len(ohlcv)} candles, last timestamp: {datetime.fromtimestamp(last_timestamp/1000)}")
+                            
+                            # Rate limiting to avoid API restrictions
+                            time.sleep(exchange.rateLimit / 1000)
+                            
+                            # Break if we've reached end date
+                            if last_timestamp >= until:
+                                break
+                        
+                        if not all_ohlcv:
+                            print(f"No data fetched for {timeframe} from {exchange_id}")
+                            success = False
+                            break
+                            
                         # Convert to DataFrame
-                        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                         df.set_index('timestamp', inplace=True)
+                        
+                        # Filter to ensure we only have data within our date range
+                        df = df[(df.index >= start_date) & (df.index <= end_date)]
+                        
+                        # Remove duplicates if any
+                        df = df[~df.index.duplicated(keep='first')]
+                        
+                        # Sort by timestamp to ensure chronological order
+                        df = df.sort_index()
+                        
+                        # Verify data range
+                        print(f"Data range for {timeframe}: {df.index[0]} to {df.index[-1]}, {len(df)} candles")
                         
                         # Calculate indicators
                         df = self.calculate_indicators(df)
                         
                         data[name] = df
-                        print(f"Fetched {len(df)} {timeframe} candles for ETH/USDT from {exchange_id}")
+                        
                     except Exception as e:
                         print(f"Error fetching {timeframe} data from {exchange_id}: {str(e)}")
                         success = False
@@ -240,13 +287,14 @@ class ETHBacktester:
         entry_strength = entry_signals / max_possible_signals if max_possible_signals > 0 else 0
         exit_strength = exit_signals / max_possible_signals if max_possible_signals > 0 else 0
         
-        # Log signal strengths periodically (every 6 hours)
-        if timestamp.hour % 6 == 0 and timestamp.minute == 0:
-            print(f"\nSignal analysis at {timestamp}:")
+        # Log signal strengths periodically (every day)
+        if timestamp.hour == 0 and timestamp.minute == 0:
+            print(f"\n=== Daily Signal Analysis at {timestamp} ===")
             print(f"Price: ${current_price:.2f}")
-            print(f"Entry signals: {entry_signals} / {max_possible_signals} (strength: {entry_strength:.2f})")
-            print(f"Exit signals: {exit_signals} / {max_possible_signals} (strength: {exit_strength:.2f})")
+            print(f"Entry signals: {entry_signals:.2f} / {max_possible_signals} (strength: {entry_strength:.2f})")
+            print(f"Exit signals: {exit_signals:.2f} / {max_possible_signals} (strength: {exit_strength:.2f})")
             print(f"Current position: {'In position' if self.in_position else 'No position'}")
+            print(f"Trading capital: ${self.trading_capital:.2f}")
             
             # Log detailed analysis for each timeframe
             for tf in analysis_results:
@@ -256,37 +304,58 @@ class ETHBacktester:
                 print(f"  Momentum: {analysis['momentum']}")
                 print(f"  MACD: {analysis['macd_signal']}")
                 print(f"  BB: {analysis['bb_signal']}")
+                if 'price_action' in analysis:
+                    print(f"  Price Action: {analysis['price_action']}")
                 print(f"  Entry signals: {analysis['entry_signals']}")
                 print(f"  Exit signals: {analysis['exit_signals']}")
         
-        # Log when we're close to a trading decision
-        if entry_strength > 0.3 and not self.in_position:
+        # Log when we're close to a trading decision (within 80% of threshold)
+        threshold_proximity = 0.8
+        entry_threshold = 0.5
+        exit_threshold = 0.4
+        
+        if entry_strength > entry_threshold * threshold_proximity and not self.in_position:
             print(f"\nClose to BUY at {timestamp}:")
-            print(f"Entry strength: {entry_strength:.2f} (threshold: 0.35)")
+            print(f"Price: ${current_price:.2f}")
+            print(f"Entry strength: {entry_strength:.2f} (threshold: {entry_threshold})")
             for tf in analysis_results:
                 print(f"  {tf} signals: {analysis_results[tf]['entry_signals']}")
         
-        if exit_strength > 0.3 and self.in_position:
+        if exit_strength > exit_threshold * threshold_proximity and self.in_position:
             print(f"\nClose to SELL at {timestamp}:")
-            print(f"Exit strength: {exit_strength:.2f} (threshold: 0.3)")
+            print(f"Price: ${current_price:.2f}")
+            print(f"Exit strength: {exit_strength:.2f} (threshold: {exit_threshold})")
             for tf in analysis_results:
                 print(f"  {tf} signals: {analysis_results[tf]['exit_signals']}")
         
-        # Make decision - more aggressive thresholds
+        # Log actual trading decisions
+        decision = 'wait'
         if self.in_position:
             # For existing positions, consider exit
-            if exit_strength > 0.3:  # Lowered from 0.4 for more trades
-                return 'sell'
+            if exit_strength > exit_threshold:
+                decision = 'sell'
+                print(f"\n!!! SELL SIGNAL at {timestamp} !!!")
+                print(f"Price: ${current_price:.2f}")
+                print(f"Exit strength: {exit_strength:.2f} (threshold: {exit_threshold})")
             else:
-                return 'hold'
+                decision = 'hold'
         else:
             # For potential new positions
-            if entry_strength > 0.35:  # Lowered from 0.5 for more trades
+            if entry_strength > entry_threshold:
                 # Check if we have available trading capital
                 if self.trading_capital > 0:
-                    return 'buy'
-            
-            return 'wait'
+                    decision = 'buy'
+                    print(f"\n!!! BUY SIGNAL at {timestamp} !!!")
+                    print(f"Price: ${current_price:.2f}")
+                    print(f"Entry strength: {entry_strength:.2f} (threshold: {entry_threshold})")
+        
+        # Log signal distribution histogram monthly
+        if timestamp.day == 1 and timestamp.hour == 0 and timestamp.minute == 0:
+            print(f"\n=== Monthly Signal Distribution as of {timestamp} ===")
+            print(f"Entry strength distribution (threshold: {entry_threshold}):")
+            print(f"Exit strength distribution (threshold: {exit_threshold}):")
+        
+        return decision
     
     def execute_trade(self, action, price, timestamp):
         """Execute a trade based on the decision"""
@@ -406,12 +475,21 @@ class ETHBacktester:
         # Get hourly data for detailed price movements
         hourly_data = market_data['1h']
         
+        # Log data summary
+        print(f"Data summary:")
+        for timeframe, df in market_data.items():
+            print(f"  {timeframe}: {len(df)} candles from {df.index[0]} to {df.index[-1]}")
+        
         # Track equity curve
         equity_values = []
         timestamps = []
         max_equity = self.initial_capital
         current_drawdown = 0
         max_drawdown = 0
+        
+        # Track signal statistics
+        entry_strengths = []
+        exit_strengths = []
         
         # Iterate through each hour
         for idx, row in hourly_data.iterrows():
@@ -434,6 +512,20 @@ class ETHBacktester:
             # Make trading decision
             decision = self.make_decision(analysis_results, current_price, timestamp)
             
+            # Track signal strengths for analysis
+            if analysis_results:
+                # Calculate signal strengths
+                timeframe_weights = {'1h': 0.5, '4h': 0.3, '1d': 0.2}
+                entry_signal = sum([analysis_results[tf]['entry_signals'] * timeframe_weights.get(tf, 0.33) for tf in analysis_results])
+                exit_signal = sum([analysis_results[tf]['exit_signals'] * timeframe_weights.get(tf, 0.33) for tf in analysis_results])
+                
+                max_possible = sum(timeframe_weights.values()) * 6
+                entry_strength = entry_signal / max_possible if max_possible > 0 else 0
+                exit_strength = exit_signal / max_possible if max_possible > 0 else 0
+                
+                entry_strengths.append(entry_strength)
+                exit_strengths.append(exit_strength)
+            
             # Execute trade if needed
             if decision in ['buy', 'sell']:
                 self.execute_trade(decision, current_price, timestamp)
@@ -455,6 +547,21 @@ class ETHBacktester:
         # Store final equity curve and drawdown
         self.equity_curve = list(zip(timestamps, equity_values))
         self.max_drawdown = max_drawdown
+        
+        # Log signal strength statistics
+        if entry_strengths:
+            print("\nSignal Strength Statistics:")
+            print(f"Entry strength - Min: {min(entry_strengths):.4f}, Max: {max(entry_strengths):.4f}, Avg: {sum(entry_strengths)/len(entry_strengths):.4f}")
+            print(f"Exit strength - Min: {min(exit_strengths):.4f}, Max: {max(exit_strengths):.4f}, Avg: {sum(exit_strengths)/len(exit_strengths):.4f}")
+            
+            # Count how many times signals were close to thresholds
+            entry_threshold = 0.5
+            exit_threshold = 0.4
+            close_entries = sum(1 for s in entry_strengths if s > entry_threshold * 0.8 and s < entry_threshold)
+            close_exits = sum(1 for s in exit_strengths if s > exit_threshold * 0.8 and s < exit_threshold)
+            
+            print(f"Signals close to but below entry threshold: {close_entries}")
+            print(f"Signals close to but below exit threshold: {close_exits}")
         
         # Calculate performance metrics
         final_value = equity_values[-1] if equity_values else self.initial_capital
@@ -509,7 +616,9 @@ class ETHBacktester:
             'avg_loss': avg_loss,
             'profit_factor': profit_factor,
             'equity_curve': self.equity_curve,
-            'trades': self.trades
+            'trades': self.trades,
+            'entry_strengths': entry_strengths,
+            'exit_strengths': exit_strengths
         }
     
     def plot_results(self, results):
@@ -577,8 +686,10 @@ if __name__ == "__main__":
     # Create backtester instance
     backtester = ETHBacktester(initial_capital=2000)
     
-    # Fetch historical data
-    market_data = backtester.fetch_historical_data(days=30)
+    # Fetch historical data for 1 year
+    days = 365
+    print(f"Starting backtest for the last {days} days")
+    market_data = backtester.fetch_historical_data(days=days)
     
     # Run backtest
     results = backtester.run_backtest(market_data)
