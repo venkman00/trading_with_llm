@@ -482,8 +482,12 @@ class ETHBacktester:
                     'take_profit': self.take_profit
                 })
                 
+                # Log trade details with balance information
                 self.logger.info(f"BUY at {timestamp}: {position_size:.6f} ETH at ${price:.2f}, " + 
                       f"Cost: ${cost:.2f}, Stop: ${self.stop_loss:.2f}, Target: ${self.take_profit:.2f}")
+                self.logger.info(f"BALANCE after BUY: Trading Capital: ${self.trading_capital:.2f}, " +
+                      f"Position Value: ${self.position_size * price:.2f}, " +
+                      f"Total Portfolio: ${self.calculate_portfolio_value(price):.2f}")
         
         elif action == 'sell' and self.in_position:
             # Calculate profit/loss
@@ -492,6 +496,7 @@ class ETHBacktester:
             
             # Execute sell order
             sale_value = self.position_size * price
+            previous_trading_capital = self.trading_capital
             self.trading_capital += sale_value
             
             # Record the trade
@@ -505,8 +510,13 @@ class ETHBacktester:
                 'pl_amount': pl_amount
             })
             
+            # Log trade details with balance information
             self.logger.info(f"SELL at {timestamp}: {self.position_size:.6f} ETH at ${price:.2f}, " + 
                   f"P/L: {pl_percent:.2%} (${pl_amount:.2f})")
+            self.logger.info(f"BALANCE after SELL: Previous Trading Capital: ${previous_trading_capital:.2f}, " +
+                  f"Sale Value: ${sale_value:.2f}, New Trading Capital: ${self.trading_capital:.2f}")
+            self.logger.info(f"COMPLETE TRADE SUMMARY: Entry: ${self.entry_price:.2f}, Exit: ${price:.2f}, " +
+                  f"P/L: {pl_percent:.2%} (${pl_amount:.2f}), New Total Portfolio: ${self.calculate_portfolio_value(price):.2f}")
             
             # Reset position
             self.position_size = 0
@@ -697,31 +707,54 @@ class ETHBacktester:
             last_price = hourly_data.iloc[-1]['close']
             unrealized_pl = self.position_size * (last_price - self.entry_price)
         
-        # Print results
-        self.logger.info("\n===== BACKTEST RESULTS =====")
-        self.logger.info(f"Testing Period: {hourly_data.index[0]} to {hourly_data.index[-1]}")
-        self.logger.info(f"Initial Capital: ${self.initial_capital:.2f}")
-        self.logger.info(f"Final Capital: ${final_value:.2f}")
-        self.logger.info(f"Total Return: {total_return:.2f}%")
-        self.logger.info(f"Maximum Drawdown: {max_drawdown * 100:.2f}%")
-        self.logger.info(f"Total Trades: {total_trades}")
-        self.logger.info(f"Win Rate: {win_rate * 100:.2f}%")
-        self.logger.info(f"Average Profit: ${avg_profit:.2f}")
-        self.logger.info(f"Average Loss: ${avg_loss:.2f}")
-        self.logger.info(f"Profit Factor: {profit_factor:.2f}")
-        if self.in_position:
-            self.logger.info(f"Currently In Position: {self.position_size:.6f} ETH @ ${self.entry_price:.2f}")
-            self.logger.info(f"Unrealized P&L: ${unrealized_pl:.2f}")
+        # Print and log detailed results
+        result_summary = "\n" + "="*50 + "\n"
+        result_summary += "FINAL BACKTEST RESULTS\n"
+        result_summary += "="*50 + "\n"
+        result_summary += f"Testing Period: {hourly_data.index[0]} to {hourly_data.index[-1]}\n"
+        result_summary += f"Initial Capital: ${self.initial_capital:.2f}\n"
+        result_summary += f"Final Capital: ${final_value:.2f}\n"
+        result_summary += f"Total Return: {total_return:.2f}%\n"
+        result_summary += f"Maximum Drawdown: {max_drawdown * 100:.2f}%\n"
+        result_summary += f"Total Trades: {total_trades}\n"
+        result_summary += f"Win Rate: {win_rate * 100:.2f}%\n"
+        result_summary += f"Average Profit: ${avg_profit:.2f}\n"
+        result_summary += f"Average Loss: ${avg_loss:.2f}\n"
+        result_summary += f"Profit Factor: {profit_factor:.2f}\n"
         
-        # Log all trades
-        self.logger.info("\n===== TRADE HISTORY =====")
-        for i, trade in enumerate(self.trades):
-            if trade['action'] == 'buy':
-                self.logger.info(f"Trade {i+1}: BUY {trade['position_size']:.6f} ETH at ${trade['price']:.2f} on {trade['timestamp']}")
-            elif trade['action'] == 'sell':
-                pl_percent = trade.get('pl_percent', 0) * 100
-                pl_amount = trade.get('pl_amount', 0)
-                self.logger.info(f"Trade {i+1}: SELL {trade['position_size']:.6f} ETH at ${trade['price']:.2f} on {trade['timestamp']} - P/L: {pl_percent:.2f}% (${pl_amount:.2f})")
+        # Detailed balance breakdown
+        result_summary += "\nFINAL BALANCE BREAKDOWN:\n"
+        result_summary += f"Trading Capital (Cash): ${self.trading_capital:.2f}\n"
+        
+        if self.in_position:
+            last_price = hourly_data.iloc[-1]['close']
+            position_value = self.position_size * last_price
+            result_summary += f"Current Position: {self.position_size:.6f} ETH @ ${self.entry_price:.2f}\n"
+            result_summary += f"Position Market Value: ${position_value:.2f}\n"
+            result_summary += f"Unrealized P&L: ${unrealized_pl:.2f} ({unrealized_pl/self.entry_price/self.position_size*100:.2f}%)\n"
+            result_summary += f"Total Portfolio Value: ${self.trading_capital + position_value:.2f}\n"
+        else:
+            result_summary += f"No open positions\n"
+            result_summary += f"Total Portfolio Value: ${self.trading_capital:.2f}\n"
+        
+        # Monthly returns
+        if len(self.equity_curve) > 0:
+            result_summary += "\nMONTHLY RETURNS:\n"
+            monthly_returns = {}
+            
+            for date, value in self.equity_curve:
+                month_key = date.strftime('%Y-%m')
+                monthly_returns[month_key] = value
+            
+            prev_month_value = self.initial_capital
+            for month, value in sorted(monthly_returns.items()):
+                month_return = (value / prev_month_value - 1) * 100
+                result_summary += f"{month}: {month_return:.2f}%\n"
+                prev_month_value = value
+        
+        # Print and log the results
+        print(result_summary)
+        self.logger.info(result_summary)
         
         return {
             'initial_capital': self.initial_capital,
